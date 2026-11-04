@@ -17,8 +17,19 @@ from lerobot.envs.utils import close_envs
 from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
+from jitpi05.progress import StageProgressProbe, resolve_control
+from jitpi05.jitrl.learned_key import LearnedKeyMemory
+
+from jitpi05.jitrl.motion_actions import (
+    MOTION_COMMANDS,
+    condition_for_chunk as _motion_condition_for_chunk,
+    parse_program as parse_motion_program,
+)
+
 from jitpi05.config import (
     ALL_METHODS,
+    MOTION_METHODS,
+    ORACLE_METHODS,
     CYCLE_BACKTRACK_EXTRA_BUDGET,
     CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
@@ -142,8 +153,43 @@ FREE_METHODS = (
     "static-free",
     "jitrl-free-cycle",
     "static-free-cycle",
+    # oracle 也走自由候选那条规划路径（候选照常生成、照常记进 trace），
+    # 只是在最后把送进低层的那句话换成真值子任务，好让两者可直接对比。
+    "oracle-free",
 )
 DIRECT_METHODS = ("direct", "direct-cycle")
+
+
+def _motion_program() -> tuple[str, ...]:
+    """``motion-prog`` 用的命令序列，来自环境变量（``|`` 分隔）。"""
+    import os as _os
+
+    return parse_motion_program(_os.environ.get("JITPI05_MOTION_PROGRAM", ""))
+
+
+def _motion_chunks_per_command() -> int:
+    """每条动作命令占用几个低层 chunk。默认 8（= 40 个环境步）。"""
+    import os as _os
+
+    try:
+        return max(1, int(_os.environ.get("JITPI05_MOTION_CHUNKS", "8")))
+    except ValueError:
+        return 8
+
+
+def _build_stage_probe(env, task_spec):
+    """按任务 spec 里的 goal.json 建一个分阶段进度探针；没有就返回 None。
+
+    LIBERO 的判据是整任务二值的，测不出「做到了第几步」。RoboCerebra 的
+    goal.json 提供每步的符号状态对，见 jitpi05/progress.py。
+    """
+    goals = task_spec.get("progress_goals")
+    if not goals:
+        return None
+    control = resolve_control(env)
+    if control is None:
+        return None
+    return StageProgressProbe(control, goals)
 
 
 def _low_level_condition(overall_task: str, subtask: str) -> str:
@@ -160,9 +206,37 @@ def _low_level_condition(overall_task: str, subtask: str) -> str:
 
 
 def _direct_condition(overall_task: str) -> str:
-    """Keep the original task as the sole language condition for direct methods."""
+    """Keep the original task as the sole language condition for direct methods.
 
-    return str(overall_task).strip()
+    实验用覆盖（``JITPI05_PROMPT_OVERRIDE``）——用来单独测「这句话的内容管不管用」：
+
+        ``@N``    换成 LIBERO-10 第 N 个任务的描述
+        ``SCRAM`` 本任务描述，只把词序打乱（同词袋、同长度，说不出任何话）
+        其它串    原样使用
+
+    ⚠ 只影响喂给低层的那句话，不改任何其它逻辑。所有调用点（含写进 episode
+    记录的 ``low_level_condition``）一并生效，所以记录与实际条件始终一致。
+    """
+    import os as _os
+    import random as _random
+
+    raw = _os.environ.get("JITPI05_PROMPT_OVERRIDE", "").strip()
+    if not raw:
+        return str(overall_task).strip()
+    if raw.startswith("@"):
+        from jitpi05.config import _LIBERO10_TASK_DESCRIPTIONS as _L10
+        try:
+            return str(_L10[int(raw[1:])]).strip()
+        except (ValueError, IndexError):
+            return str(overall_task).strip()
+    if raw.upper() == "SCRAM":
+        words = str(overall_task).strip().rstrip(".").split()
+        if len(words) < 3:
+            return str(overall_task).strip()
+        head, rest = words[0], words[1:]
+        _random.Random(20260922).shuffle(rest)
+        return " ".join([head] + rest)
+    return raw
 
 
 def _libero_dummy_action() -> torch.Tensor:
@@ -2148,6 +2222,141 @@ def _run_episode_cycle(
     return episode_result, episode_records, tensors, evaluator_images
 
 
+# 阶段 1 用的动作级方法：候选集是 MOTION_COMMANDS，不走 Qwen。
+MOTION_MEMORY_METHODS = ("motion-jitrl", "motion-jitrl-learn", "act-jitrl")
+MOTION_HIGH_LEVEL_METHODS = ("motion-static", "motion-jitrl", "motion-jitrl-learn",
+                             "act-static", "act-jitrl")
+
+
+def _motion_state_summary(frame: dict, task: str) -> str:
+    """动作级方法的确定性状态摘要。
+
+    ⚠ 这是对原论文的一处**故意简化**：JitRL 的状态摘要由 VLM 写，
+    这条路径没有 Qwen，所以改用末端位姿与夹爪的粗分箱（0.05 m / 0.02 两档），
+    交给 JitRLMemory 的 Jaccard 检索。整条链路确定、可复算、不依赖外部 API。
+    """
+    state = frame.get("observation.state") if isinstance(frame, dict) else None
+    if state is None:
+        return "task=%s state=unknown" % task[:40]
+    try:
+        v = torch.as_tensor(state).reshape(-1).float().cpu().numpy()
+    except Exception:  # noqa: BLE001
+        return "task=%s state=unreadable" % task[:40]
+    if v.size < 3:
+        return "task=%s state=short" % task[:40]
+    q = lambda a, s: float(round(float(a) / s) * s)  # noqa: E731
+    grip = float(v[-2:].sum()) if v.size >= 8 else 0.0
+    return "task=%s x=%.2f y=%.2f z=%.2f grip=%.2f" % (
+        task[:40], q(v[0], 0.05), q(v[1], 0.05), q(v[2], 0.05), q(grip, 0.02))
+
+
+def _motion_select(
+    method: str,
+    memory,
+    state_summary: str,
+    commands,
+    seed: int,
+    episode_index: int,
+    high_level_step: int,
+) -> str:
+    """在高层的第 high_level_step 步挑一条运动原语。"""
+    if method not in MOTION_HIGH_LEVEL_METHODS:
+        raise ValueError("not a motion high-level method: %r" % method)
+    uniform = coordinate_uniform(seed, episode_index, high_level_step)
+    # 阶段 2：检索键可学，选择由 LearnedKeyMemory 自己按 softmax 采样
+    if method == "motion-jitrl-learn":
+        if memory is None:
+            raise RuntimeError("motion-jitrl-learn requires a LearnedKeyMemory")
+        chosen, _ = memory.select(state_summary, commands)
+        if chosen:
+            return chosen
+        fallback = commands[min(int(uniform * len(commands)), len(commands) - 1)]
+        memory.note_uniform(state_summary, fallback)
+        return fallback
+    if method in ("motion-jitrl", "act-jitrl") and memory is not None and len(memory) > 0:
+        keys = list(commands)
+        value_estimate = memory.estimate_candidate_values(
+            state_summary, keys,
+            exploration_uniforms=[uniform] * len(keys),
+            exploration_rate=JITRL_EXPLORATION_RATE,
+            ucb_alpha=JITRL_UCB_ALPHA,
+        )
+        update = apply_jitrl_update(
+            [0.0] * len(keys),
+            [item["normalized_advantage"] for item in value_estimate["candidates"]],
+            beta=JITRL_BETA,
+            temperature=JITRL_TEMPERATURE,
+            uniform=uniform,
+        )
+        return keys[update["updated_choice_index"]]
+    # motion-static（以及记忆还空着的第一个回合）：均匀随机
+    return commands[min(int(uniform * len(commands)), len(commands) - 1)]
+
+
+ACT_METHODS = ("act-static", "act-jitrl")
+
+
+# 动作残差候选：九个方向。索引 0..5 是位姿增量，6 是夹爪。
+ACT_BIASES = (
+    ("hold", (0, 0, 0, 0, 0, 0, 0)),
+    ("+x", (1, 0, 0, 0, 0, 0, 0)),
+    ("-x", (-1, 0, 0, 0, 0, 0, 0)),
+    ("+y", (0, 1, 0, 0, 0, 0, 0)),
+    ("-y", (0, -1, 0, 0, 0, 0, 0)),
+    ("+z", (0, 0, 1, 0, 0, 0, 0)),
+    ("-z", (0, 0, -1, 0, 0, 0, 0)),
+    ("+grip", (0, 0, 0, 0, 0, 0, 1)),
+    ("-grip", (0, 0, 0, 0, 0, 0, -1)),
+)
+ACT_COMMANDS = tuple(name for name, _ in ACT_BIASES)
+
+
+def _act_alpha() -> float:
+    """残差幅度占该 chunk 自身动作幅度的比例。默认 0.5。"""
+    import os as _os
+
+    try:
+        return float(_os.environ.get("JITPI05_ACT_ALPHA", "0.5"))
+    except ValueError:
+        return 0.5
+
+
+def _apply_act_bias(action_chunk, name: str, alpha: float):
+    """把一条方向偏置加到整段动作 chunk 上。
+
+    ⚠ 幅度按 **chunk 自身的平均绝对动作** 缩放，而不是写死一个常数——
+    postprocessor 之后的动作单位是数据集自己的，写死常数在不同底座上含义不同。
+    """
+    if not name or alpha <= 0:
+        return action_chunk
+    vec = None
+    for n, v in ACT_BIASES:
+        if n == name:
+            vec = v
+            break
+    if vec is None:
+        return action_chunk
+    scale = float(action_chunk.abs().mean()) * float(alpha)
+    if scale <= 0:
+        return action_chunk
+    bias = torch.tensor(vec, dtype=action_chunk.dtype, device=action_chunk.device)
+    bias = bias[: action_chunk.shape[-1]] * scale
+    return action_chunk + bias
+
+
+def _libero_mem_progress(env) -> dict | None:
+    """LIBERO-Mem 面板的分步进度；其它面板返回 None。
+
+    环境是 SyncVectorEnv → LiberoEnv → OffScreenRenderEnv，真实的 problem 对象
+    在内层（``env.envs[0]._env.env``）。整条链上任何一环缺失都返回 None，
+    所以这个调用对非 LIBERO-Mem 面板是完全无害的。
+    """
+    try:
+        return env.envs[0]._env.env.libero_mem_progress()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _run_episode_direct(
     *,
     task_spec: dict[str, Any],
@@ -2159,6 +2368,7 @@ def _run_episode_direct(
     preprocessor,
     postprocessor,
     step_progress=None,
+    memory=None,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
     """Run a visual closed loop with the original task as the constant prompt.
 
@@ -2168,8 +2378,10 @@ def _run_episode_direct(
     open-loop execution.
     """
 
-    if method != "direct":
-        raise ValueError(f"direct episode requires method='direct'; got {method!r}")
+    if method != "direct" and method not in MOTION_METHODS and method not in ACT_METHODS:
+        raise ValueError(
+            f"direct episode requires method='direct' or a motion method; got {method!r}"
+        )
     budget_max_steps = evaluation_budget_max_steps(task_spec)
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec,
@@ -2191,12 +2403,46 @@ def _run_episode_direct(
     try:
         reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
         observation, _ = env.reset(seed=[episode_seed])
+        # 关掉 robosuite 自带的 horizon(1000) 终止。RoboCerebra 的任务预算
+        # (2000) 超过它，不关会在第 1000 步抛 "executing action in terminated
+        # episode"。LIBERO 家族的预算(800)小于它，所以此前一直没暴露。
+        disable_robosuite_horizon_done(env)
         overall_task = list(env.call("task_description"))[0]
         condition = _direct_condition(overall_task)
+        # motion-prog：低层语言条件换成动作级命令，按固定节奏轮换。
+        motion_program = _motion_program() if method == "motion-prog" else ()
+        motion_per = _motion_chunks_per_command() if motion_program else 0
+        # 阶段 1：动作级方法（motion-static / motion-jitrl）的候选集与记录缓冲
+        # 动作残差方法：候选是九个方向，低层条件**保持原任务描述**
+        act_commands = (
+            ACT_COMMANDS if method in ("act-static", "act-jitrl") else ()
+        )
+        act_bias_name = "hold" if act_commands else ""
+        act_alpha = _act_alpha() if act_commands else 0.0
+        motion_commands = (
+            MOTION_COMMANDS
+            if method in ("motion-static", "motion-jitrl", "motion-jitrl-learn")
+            else ()
+        )
+        motion_per = motion_per or (
+            1 if act_commands
+            else (_motion_chunks_per_command() if motion_commands else 0)
+        )
+        motion_records: list[dict] = []
+        selected_command = ""
         frames.append(env.render()[0])
+        probe = _build_stage_probe(env, task_spec)
+        stage_progress: list[dict] = []
 
         while len(actions) < budget_max_steps and not success and not episode_done:
             low_level_chunk_index = len(action_chunks)
+            if probe is not None:
+                _s = probe.snapshot()
+                if _s:
+                    stage_progress.append(
+                        {"low_level_chunk_index": low_level_chunk_index,
+                         "steps": len(actions), **_s}
+                    )
             _atomic_write_json(
                 run_dir / "progress.json",
                 {
@@ -2208,7 +2454,10 @@ def _run_episode_direct(
                     "steps": len(actions),
                     "max_steps": budget_max_steps,
                     "planner_enabled": False,
-                    "low_level_condition_mode": "raw_task_constant",
+                    "low_level_condition_mode": (
+                        "motion_command" if motion_program else "raw_task_constant"
+                    ),
+                    "low_level_condition_current": condition,
                 },
             )
             if step_progress is not None:
@@ -2217,6 +2466,32 @@ def _run_episode_direct(
                     refresh=True,
                 )
             frame = policy_frame(observation, overall_task, env_preprocessor)
+            # 动作级条件的确定放在 frame 之后——状态摘要要用 frame。
+            if motion_program:
+                condition = _motion_condition_for_chunk(
+                    motion_program, low_level_chunk_index, motion_per
+                )
+            elif motion_commands or act_commands:
+                _cands = motion_commands or act_commands
+                high_level_step = low_level_chunk_index // max(1, motion_per)
+                if low_level_chunk_index % max(1, motion_per) == 0:
+                    _summary = _motion_state_summary(frame, overall_task)
+                    selected_command = _motion_select(
+                        method, memory, _summary, _cands,
+                        seed, episode_index, high_level_step,
+                    )
+                    motion_records.append(
+                        {"state": _summary, "action_key": selected_command,
+                         "action_text": selected_command,
+                         "chunk_index": low_level_chunk_index}
+                    )
+                    if act_commands:
+                        act_bias_name = selected_command
+                # motion 系列：条件换成选中的那条命令
+                # act 系列：**不改**低层语言条件——目标信息必须留着。
+                #           改的是动作，不是那句话。这与阶段 1 的动作词表是两回事。
+                if motion_commands:
+                    condition = selected_command
             conditioned_frame = dict(frame)
             conditioned_frame["task"] = [condition]
             batch = preprocessor(conditioned_frame)
@@ -2235,6 +2510,9 @@ def _run_episode_direct(
                 raise ValueError(
                     "predict_action_chunk must return the complete configured action chunk"
                 )
+            # 动作残差：记忆选中的方向直接加到动作上（低层语言条件不变）
+            if act_commands:
+                action_chunk = _apply_act_bias(action_chunk, act_bias_name, act_alpha)
             action_chunks.append(action_chunk.detach().cpu())
             del batch, normalized_chunk
             action_start_step = len(actions)
@@ -2268,7 +2546,12 @@ def _run_episode_direct(
                     "action_start_step": action_start_step,
                     "action_end_step": len(actions),
                     "planner_enabled": False,
-                    "low_level_condition_mode": "raw_task_constant",
+                    "low_level_condition_mode": (
+                        "motion_memory" if motion_commands else "raw_task_constant"
+                    ),
+                    # LIBERO-Mem 面板才有：做到第几步 / 共几步 / 是否过冲。
+                    # 其它面板上是 None，对既有结果零影响。
+                    "mem_progress": _libero_mem_progress(env),
                     "return": 0.0,
                 }
             )
@@ -2282,6 +2565,25 @@ def _run_episode_direct(
 
     if termination_reason is None:
         termination_reason = "max_steps"
+    # 阶段 1：把这一回合的 (状态, 动作) 写进记忆。
+    # 回报用终止成功与否按 chunk 折扣回填——原论文由评估器逐步打分，
+    # 这条路径没有评估器，阶段 1 只测接口，故取最简。
+    if motion_records and memory is not None:
+        n = len(motion_records)
+        _gamma = 0.95
+        _payoff = 1.0 if success else 0.0
+        _rets = [_payoff * (_gamma ** (n - 1 - i)) for i in range(n)]
+        memory.append_episode(motion_records, _rets, episode_index)
+        # 阶段 2：用回合回报对检索键权重做一步 REINFORCE（只有 learn 变体有这个）
+        if hasattr(memory, "finish_episode"):
+            _info = memory.finish_episode(_payoff, list(motion_commands))
+            print("[learned-key] ep=%d R=%.2f adv=%+.3f |g|=%.4f updates=%d w=%s"
+                  % (episode_index, _payoff, _info["advantage"], _info["grad_norm"],
+                     memory.updates,
+                     {k: round(v, 3) for k, v in
+                      zip(("task", "x", "y", "z", "grip"),
+                          [float(x) for x in memory.weights()])}),
+                  flush=True)
     tensors = _episode_tensors(action_chunks, actions, rewards, policy)
     episode_result = {
         "episode_index": episode_index,
@@ -2296,11 +2598,18 @@ def _run_episode_direct(
         "chunk_count": len(chunks),
         "high_level_step_count": 0,
         "low_level_chunk_count": len(action_chunks),
+        "stage_progress": stage_progress,
+        "stage_done_final": (stage_progress[-1].get("stage_done") if stage_progress else 0),
+        "stage_total": (stage_progress[0].get("stage_total") if stage_progress else 0),
         "video_path": str(video_path),
         "chunks": chunks,
         "planner_enabled": False,
         "memory_enabled": False,
-        "low_level_condition_mode": "raw_task_constant",
+        "low_level_condition_mode": (
+            "motion_command" if motion_program else "raw_task_constant"
+        ),
+        "motion_program": list(motion_program),
+        "motion_chunks_per_command": int(motion_per),
         "low_level_condition": _direct_condition(overall_task),
         "cycle_enabled": False,
         "cycle_internal_program": False,
@@ -2328,7 +2637,7 @@ def _run_episode(
     step_progress=None,
     counterfactual_recovery: bool = False,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
-    if method == "direct":
+    if method == "direct" or method in MOTION_METHODS:
         return _run_episode_direct(
             task_spec=task_spec,
             method=method,
@@ -2339,6 +2648,7 @@ def _run_episode(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             step_progress=step_progress,
+            memory=memory,
         )
     if method in CYCLE_METHODS:
         return _run_episode_cycle(
@@ -2386,12 +2696,25 @@ def _run_episode(
     try:
         reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
         observation, _ = env.reset(seed=[episode_seed])
+        # 关掉 robosuite 自带的 horizon(1000) 终止。RoboCerebra 的任务预算
+        # (2000) 超过它，不关会在第 1000 步抛 "executing action in terminated
+        # episode"。LIBERO 家族的预算(800)小于它，所以此前一直没暴露。
+        disable_robosuite_horizon_done(env)
         overall_task = list(env.call("task_description"))[0]
         max_steps = int(env.call("_max_episode_steps")[0])
         frames.append(env.render()[0])
+        probe = _build_stage_probe(env, task_spec)
+        stage_progress: list[dict] = []
 
         while len(actions) < max_steps and not success and not episode_done:
             low_level_chunk_index = len(action_chunks)
+            if probe is not None:
+                _s = probe.snapshot()
+                if _s:
+                    stage_progress.append(
+                        {"low_level_chunk_index": low_level_chunk_index,
+                         "steps": len(actions), **_s}
+                    )
             high_level_step_index = low_level_chunk_index // low_level_chunks_per_plan
             high_level_replan = low_level_chunk_index % low_level_chunks_per_plan == 0
             progress = {
@@ -2520,6 +2843,26 @@ def _run_episode(
                     else update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
+                if method in ORACLE_METHODS:
+                    # oracle 上界：不走候选打分的结果，直接把真值子任务按序喂进去。
+                    # 切窗、记录、评估全部与 static-free 一致，唯一差别是这句话。
+                    #
+                    # ⚠ 推进节奏按**低层 chunk 序号在整个预算上均匀分配**，不能按高层
+                    # 步数：高层每 high_level_chunks_per_plan 个 chunk 就重规划一次，
+                    # 6 个子任务会在前 240 步内用光，剩下 1760 步一直重复最后一条。
+                    _gt = tuple(task_spec.get("oracle_subtasks") or ())
+                    if _gt:
+                        if probe is not None and probe.enabled:
+                            # 真正的 oracle：**上一步真的达成了才推进**。达成不了就
+                            # 一直停在这一步——这正是「完美规划会怎么做」。
+                            _gi = min(probe.last_done, len(_gt) - 1)
+                        else:
+                            # 没有进度信号时退化成按时钟均匀分配（不如按达成推进准）。
+                            _per = max(1, max_steps // (len(_gt) * POLICY_ACTION_STEPS))
+                            _gi = min(low_level_chunk_index // _per, len(_gt) - 1)
+                        selected_candidate = dict(selected_candidate)
+                        selected_candidate["text"] = _gt[_gi]
+                        selected_candidate["semantic_key"] = f"oracle|{_gi}"
                 active_condition = _low_level_condition(
                     overall_task, selected_candidate["text"]
                 )
@@ -2587,6 +2930,8 @@ def _run_episode(
                 raise RuntimeError("low-level replan has no cached high-level subtask")
 
             low_level_action_start_step = len(actions)
+            # LIBERO-Mem 面板才有；其它面板返回 None，对既有结果零影响。
+            _lm_progress_now = _libero_mem_progress(env)
             conditioned_frame = dict(frame)
             conditioned_frame["task"] = [active_condition]
             batch = preprocessor(conditioned_frame)
@@ -2633,6 +2978,7 @@ def _run_episode(
                     "chunk_index": low_level_chunk_index,
                     "action_start_step": low_level_action_start_step,
                     "action_end_step": len(actions),
+                    "mem_progress": _lm_progress_now,
                 }
             )
             if (
@@ -2692,6 +3038,9 @@ def _run_episode(
         "chunk_count": len(chunks),
         "high_level_step_count": len(chunks),
         "low_level_chunk_count": len(action_chunks),
+        "stage_progress": stage_progress,
+        "stage_done_final": (stage_progress[-1].get("stage_done") if stage_progress else 0),
+        "stage_total": (stage_progress[0].get("stage_total") if stage_progress else 0),
         "video_path": str(video_path),
         "chunks": chunks,
         "cycle_enabled": False,
@@ -2863,9 +3212,14 @@ def run_jitrl_experiment(
         directory.mkdir(parents=True, exist_ok=True)
 
     episode_results: list[dict] = []
-    memory = (
-        JitRLMemory(top_k=JITRL_TOP_K) if method in MEMORY_METHODS else None
-    )
+    if method == "motion-jitrl-learn":
+        memory = LearnedKeyMemory(
+            top_k=JITRL_TOP_K, beta=JITRL_BETA, temperature=JITRL_TEMPERATURE, seed=seed
+        )
+    elif method in MEMORY_METHODS or method in MOTION_MEMORY_METHODS:
+        memory = JitRLMemory(top_k=JITRL_TOP_K)
+    else:
+        memory = None
     _atomic_write_json(run_dir / "episodes.json", episode_results)
     _atomic_write_json(run_dir / "memory.json", _memory_snapshot(memory))
     if counterfactual_recovery:
@@ -2916,7 +3270,7 @@ def run_jitrl_experiment(
                 f"[load] task={task_name} method={method} seed={seed}: "
                 "loading Qwen planner"
             )
-            if method not in DIRECT_METHODS:
+            if method not in DIRECT_METHODS and method not in MOTION_METHODS:
                 planner_model, planner_processor = load_jitrl_planner()
             if method in MEMORY_METHODS:
                 tqdm.write(

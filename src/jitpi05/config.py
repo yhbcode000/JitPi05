@@ -24,7 +24,12 @@ TOP_K = 5  # 离线规划 logits top-k 分析
 
 # 底层动作策略
 PI05_ID = "lerobot/pi05_libero_base"  # 离线仿真策略
-SIM_PI05_ID = "lerobot/pi05-libero"  # JitRL 与模拟共享的策略
+# 低层策略权重。默认是 LIBERO 微调版；设 JITPI05_LOW_LEVEL_POLICY_ID 可换成
+# 其它底座做对照（例如未微调的基础模型 lerobot/pi05_libero_base）。
+SIM_PI05_ID = (
+    os.environ.get("JITPI05_LOW_LEVEL_POLICY_ID", "").strip()
+    or "lerobot/pi05-libero"
+)  # JitRL 与模拟共享的策略
 PI05_TOKENIZER_ID = "nnh-pbbb/paligemma-3b-pt-224"
 
 # =========================================================================
@@ -52,6 +57,15 @@ JITRL_METHODS = ("jitrl-free", "static-free")
 DIRECT_METHODS = ("direct", "direct-cycle")
 # 固定工作集（HarnessVLA 固定原语）方法：jitrl（在线记忆调制）/ static（无调制）。
 JITRL_FIXED_METHODS = ("jitrl", "static")
+# oracle 上界对照：不做规划、不检索，把任务的**真值子任务序列**按顺序喂给低层。
+# 用来测「高层这一层的上界」——完美规划值多少分。任务 spec 必须带
+# "oracle_subtasks" 字段（RoboCerebra 面板会填），否则退化成 static-free。
+ORACLE_METHODS = ("oracle-free",)
+# 动作级指令方法：低层语言条件不是「任务级子任务」，而是 SARL 那种**不点名物体**
+# 的动作命令（move right / close the gripper / …），按固定节奏轮换。用来测
+# 「动作级指令能不能驱动这个底座」。见 jitpi05/jitrl/motion_actions.py。
+MOTION_METHODS = ("motion-prog", "motion-static", "motion-jitrl", "motion-jitrl-learn",
+                  "act-static", "act-jitrl")
 CYCLE_JITRL_METHODS = (
     "static-free",
     "jitrl-free",
@@ -68,7 +82,14 @@ CYCLE_METHODS = tuple(
 # rollout.run_jitrl_experiment 使用本常量校验 method，因此必须包含固定工作集方法。
 ALL_METHODS = tuple(
     dict.fromkeys(
-        (*JITRL_METHODS, *JITRL_FIXED_METHODS, *DIRECT_METHODS, *CYCLE_METHODS)
+        (
+            *JITRL_METHODS,
+            *JITRL_FIXED_METHODS,
+            *DIRECT_METHODS,
+            *CYCLE_METHODS,
+            *ORACLE_METHODS,
+            *MOTION_METHODS,
+        )
     )
 )
 # CLI --method 可选全集与 ALL_METHODS 保持一致（含自由候选、固定工作集与 Cycle 方法）。
@@ -83,9 +104,9 @@ JITRL_HIGH_LEVEL_STEPS = 40  # 高层决策总步数（须能被 SIM_ACTION_STEP
 JITRL_PLANNER_RETRIES = 7  # 高层规划重试（free 与固定工作区统一）
 JITRL_EVALUATOR_RETRIES = 15  # 每个 chunk 的 Gemini 评估重试（指数退避）
 JITRL_HISTORY_SIZE = 2
-JITRL_TOP_K = 10
+JITRL_TOP_K = int(os.environ.get("JITPI05_TOP_K", "1").strip())
 JITRL_GAMMA = 0.95
-JITRL_BETA = 0.40
+JITRL_BETA = float(os.environ.get("JITPI05_BETA", "0.40").strip())
 JITRL_TEMPERATURE = 0.8
 JITRL_EXPLORATION_RATE = 0.05
 JITRL_UCB_ALPHA = 5.0
@@ -134,8 +155,18 @@ CYCLE_MAX_RETRIES = 3
 # Keep baseline and Cycle comparable while allowing enough time for bounded
 # recovery attempts. The official LIBERO horizon remains 400; this experiment
 # explicitly selects the same unified 800-step budget for both methods.
-CYCLE_BUDGET_MODE = "unified_800"
-CYCLE_UNIFIED_MAX_STEPS = 800
+# 评测预算。LIBERO 家族统一 800 步（base 与 Cycle 可比）；RoboCerebra 的轨迹
+# 长得多（论文报平均 2,972 步），统一预算必须 ≥ 任务上限才不报错，因此它默认
+# 切到 official 模式——直接用每个任务自己的 max_steps。
+_PANEL_FOR_BUDGET = os.environ.get("JITPI05_JITRL_PANEL", "libero90").strip().lower()
+CYCLE_BUDGET_MODE = os.environ.get(
+    "JITPI05_CYCLE_BUDGET_MODE",
+    "official" if _PANEL_FOR_BUDGET == "robocerebra" else "unified_800",
+).strip().lower()
+CYCLE_UNIFIED_MAX_STEPS = int(os.environ.get(
+    "JITPI05_CYCLE_UNIFIED_MAX_STEPS",
+    "3000" if _PANEL_FOR_BUDGET == "robocerebra" else "800",
+))
 # 官方 evaluator 的 episode 预算 = TASK_MAX_STEPS * 1.5 + num_steps_wait。
 # 选择 ``official_1p5x`` 时按该公式计算，与 CycleVLA 论文口径一致。
 CYCLE_OFFICIAL_BUDGET_MULTIPLIER = 1.5
@@ -214,18 +245,30 @@ LIBERO90_MAX_STEPS = 400
 # LIBERO-10 官方 max_steps（与 published pi0.5-LIBERO 一致）。
 LIBERO10_MAX_STEPS = 520
 
-# 评测面板可选：环境变量 JITPI05_JITRL_PANEL=libero10 | libero90 | libero_pro
-# （默认 libero90）。
+# RoboCerebra 的轨迹远长于 LIBERO-10：论文报平均 2,972 步，子任务 4–15 个，
+# 而 LIBERO-10 是 3–6 个。本仓库对 LIBERO-10 统一用 800 步预算，按子任务数
+# 比例放大到 2000。
+# ⚠ 这是**估计值**，没有与 RoboCerebra 论文的评测口径核对过；正式比较前要核。
+ROBOCEREBRA_MAX_STEPS = 2000
+
+# 评测面板可选：环境变量 JITPI05_JITRL_PANEL=libero10 | libero90 | libero_pro |
+# robocerebra（默认 libero90）。
 # - libero10：完整 LIBERO-10 长任务 suite 全 10 任务，对应 ablation 报告的
 #   HarnessVLA × JitRL 四格配置。
 # - libero90：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较）。
 # - libero_pro：LIBERO-Pro 扰动面板（object/position/semantic/task 四维扰动，
 #   基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。
+# - robocerebra：RoboCerebra 长时程面板（arXiv:2506.06677，NeurIPS 2025 D&B）。
+#   六种任务类型（Ideal / Memory_Execution / Memory_Exploration /
+#   Observation_Mismatching / Mix / Random_Disturbance），bddl 与初始状态都是
+#   LIBERO 原生格式，**低层策略不换**。附带真值子任务序列与符号分步目标。
 JITRL_BENCHMARK_PANEL = os.environ.get("JITPI05_JITRL_PANEL", "libero90").strip().lower()
-if JITRL_BENCHMARK_PANEL not in ("libero10", "libero90", "libero_pro"):
+if JITRL_BENCHMARK_PANEL not in (
+    "libero10", "libero90", "libero_pro", "robocerebra", "libero_mem",
+):
     raise ValueError(
-        "JITPI05_JITRL_PANEL must be 'libero10', 'libero90' or 'libero_pro'; "
-        f"got {JITRL_BENCHMARK_PANEL!r}"
+        "JITPI05_JITRL_PANEL must be 'libero10', 'libero90', 'libero_pro', "
+        f"'robocerebra' or 'libero_mem'; got {JITRL_BENCHMARK_PANEL!r}"
     )
 
 # 低层策略后端：lerobot（默认，上一代 `lerobot/pi05-libero`）| rlinf
@@ -278,6 +321,19 @@ if JITRL_BENCHMARK_PANEL == "libero10":
         }
         for task_id in range(10)
     )
+elif JITRL_BENCHMARK_PANEL == "libero_mem":
+    # LIBERO-Mem（arXiv:2511.11478）面板：10 个任务用 BDDL 的 Sequence / Or 写目标，
+    # 其中六个是**同一个合取重复 N 次**（3 / 3 / 5 / 7）。
+    #   状态「碗在盘子上」在开始与结束时都成立 ⇒ **只有状态转移的历史能区分进度**。
+    # 这是本卷唯一「记忆在形式上必需」的面板。
+    #
+    # ⚠ 标准 LIBERO 只支持扁平合取，Sequence 求不了；`libero_mem` 模块用猴子补丁
+    #    挂上原作者的有状态判定器，并在 step 里推进它。见该模块的说明。
+    # ⚠ 预算：任务 2–5 要重复 3–7 次「拿起—放下」，520 步不够，给 800。
+    from jitpi05.libero_mem import libero_mem_task_specs, register_libero_mem_suite
+
+    register_libero_mem_suite()
+    JITRL_TASKS = libero_mem_task_specs(max_steps=800)
 elif JITRL_BENCHMARK_PANEL == "libero_pro":
     # LIBERO-Pro 扰动面板。注册扰动 suite 并生成任务描述；任务描述由环境在
     # 运行时提供（env.call("task_description")），此处留空占位。每个任务
@@ -287,6 +343,30 @@ elif JITRL_BENCHMARK_PANEL == "libero_pro":
     register_libero_pro_suites()
     JITRL_TASKS = libero_pro_task_specs(
         base_suite="libero_10", max_steps=LIBERO10_MAX_STEPS
+    )
+elif JITRL_BENCHMARK_PANEL == "robocerebra":
+    # RoboCerebra 面板。两个环境变量用来限规模，先做小批量筛查再扩容：
+    #   JITPI05_ROBOCEREBRA_TYPES=Memory_Execution,Ideal
+    #   JITPI05_ROBOCEREBRA_MAX_CASES=3
+    from jitpi05.robocerebra import (
+        register_robocerebra_suites,
+        robocerebra_task_specs,
+    )
+
+    _rc_types_raw = os.environ.get("JITPI05_ROBOCEREBRA_TYPES", "").strip()
+    _rc_types = (
+        tuple(x.strip() for x in _rc_types_raw.split(",") if x.strip())
+        if _rc_types_raw
+        else None
+    )
+    _rc_cases_raw = os.environ.get("JITPI05_ROBOCEREBRA_MAX_CASES", "").strip()
+    _rc_cases = int(_rc_cases_raw) if _rc_cases_raw else None
+
+    register_robocerebra_suites(types=_rc_types, max_cases=_rc_cases)
+    JITRL_TASKS = robocerebra_task_specs(
+        types=_rc_types,
+        max_cases=_rc_cases,
+        max_steps=ROBOCEREBRA_MAX_STEPS,
     )
 else:
     # LIBERO-90 预注册候选池。任务描述由环境在运行时提供
